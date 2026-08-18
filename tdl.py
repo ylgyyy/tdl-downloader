@@ -603,6 +603,23 @@ def _format_size(size_bytes):
     else:
         return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
+
+def _format_file_list(dl_dir, names):
+    """生成带大小的文件列表（最多显示 20 个），返回 (文本, 总大小)"""
+    lines = []
+    total_size = 0
+    for f in names:
+        try:
+            sz = os.path.getsize(os.path.join(dl_dir, f))
+        except Exception:
+            sz = 0
+        total_size += sz
+        if len(lines) < 20:
+            lines.append(f"{f}  ({_format_size(sz)})")
+    if len(names) > 20:
+        lines.append(f"... 还有 {len(names) - 20} 个文件")
+    return ("\n".join(lines) if lines else "（无可列出的文件）"), total_size
+
 def _get_dl_progress(dl_dir):
     """获取当前正在下载的文件大小（监控 .tmp 文件）"""
     try:
@@ -672,20 +689,20 @@ def _watch_single_download(chat_id, process, dl_dir, link, tdl_name, msg_id, tot
         renamed = _rename_new_files(dl_dir, before_files, rename_name)  # None=未重命名，保留原逻辑
         try:
             if renamed is not None:
-                file_list = "\n".join(renamed[:20]) if renamed else "（无可列出的文件）"
-                if len(renamed) > 20:
-                    file_list += f"\n... 还有 {len(renamed) - 20} 个文件"
+                names = renamed
             else:
-                files = os.listdir(dl_dir)
-                file_list = "\n".join(files[:20]) if files else "（无可列出的文件）"
-                if len(files) > 20:
-                    file_list += f"\n... 还有 {len(files) - 20} 个文件"
+                # 未重命名时，识别本次新下载的文件（排除下载前已存在的）
+                after_files = set(os.listdir(dl_dir))
+                names = sorted(after_files - set(before_files or []))
+                names = [f for f in names if not f.startswith('.') and not f.endswith('.tmp')]
+            file_list, total_size = _format_file_list(dl_dir, names)
         except Exception:
-            file_list = "无法列出文件"
+            file_list, total_size = "无法列出文件", 0
         bot.send_message(chat_id, f"""✅ 单文件下载完成！
 📥 链接：{link}
 📁 保存目录：{dl_dir}/
 🔑 使用TDL账号：@{tdl_name}
+📦 下载大小：{_format_size(total_size)}
 📂 下载文件：
 {file_list}""")
     else:
@@ -1260,6 +1277,20 @@ def handle_steps(msg):
     # ================= 下载中（等待完成或取消） =================
     elif step == "DOWNLOADING":
         bot.send_message(chat_id, "⏳ 下载正在进行中... 发送 /cancel 或点击 ❌ 取消 可中止")
+
+# ==========================
+# 直接发送链接下载（单文件）
+# ==========================
+@bot.message_handler(func=lambda msg: msg.text and re.match(r'^https://t\.me/', msg.text.strip()))
+@admin_required
+def direct_link_download(msg):
+    """直接发送消息链接即可触发单文件下载（保留原文件名）"""
+    link = msg.text.strip()
+    channel_id, msg_id = extract_channel_and_msg_id_from_link(link)
+    if not channel_id or not msg_id:
+        bot.send_message(msg.chat.id, "❌ 链接格式无效！请输入包含消息ID的完整链接（如 https://t.me/JAVDMM/36459）")
+        return
+    do_single_download(msg.chat.id, channel_id, msg_id, link)
 
 # ==========================
 # TDL账号切换

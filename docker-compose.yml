@@ -6,12 +6,13 @@ services:
 
     network_mode: "host"
 
-    # ---- 时区 & 下载目录 (密钥从同目录 .env 文件读取) ----
+    # ---- 时区 & 密钥 & 下载目录 (部署前把占位值改成真实值) ----
     environment:
       TZ: "Asia/Shanghai"
+      # ⚠️ 部署前把下面两个占位值改成真实值（Bot Token / 你的数字 ID）
+      BOT_TOKEN: "123456:ABCdef..."
+      SUPER_ADMIN: "987654321"
       DL_BASE_PATH: /downloads
-    env_file:
-      - .env
 
     volumes:
       # 持久化 TDL 登录会话，重启容器不会掉线

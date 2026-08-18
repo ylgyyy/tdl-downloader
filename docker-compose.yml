@@ -1,14 +1,18 @@
 services:
   tdl-downloader:
-    build: .
+    image: ylgy007/tdl-downloader:latest
     container_name: tdl-downloader
-    restart: always
+    restart: unless-stopped
+
     network_mode: "host"
+
+    # ---- 时区 & 下载目录 (密钥从同目录 .env 文件读取) ----
     environment:
-      # ⚠️ 部署前把下面两个占位值改成真实值（Bot Token / 你的数字 ID）
-      - BOT_TOKEN=123456:ABCdef...
-      - SUPER_ADMIN=987654321
-      - DL_BASE_PATH=/downloads
+      TZ: "Asia/Shanghai"
+      DL_BASE_PATH: /downloads
+    env_file:
+      - .env
+
     volumes:
       # 持久化 TDL 登录会话，重启容器不会掉线
       - tdl-sessions:/root/.tdl
@@ -16,6 +20,13 @@ services:
       - bot-data:/app/data
       # NAS 下载目录（宿主机路径:容器内路径）
       - /vol4/1000/影视/tdl:/downloads
+
+    # ---- 日志轮转 ----
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   tdl-sessions:

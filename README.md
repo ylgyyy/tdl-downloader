@@ -22,15 +22,16 @@
 
 ### 2. 部署
 
-编辑 `docker-compose.yml`，把其中的占位值改成真实值：
+先在 `docker-compose.yml` **同目录**下创建 `.env` 文件，存放两个必需密钥：
 
-```yaml
-environment:
-  # ⚠️ 部署前把下面两个占位值改成真实值
-  - BOT_TOKEN=123456:ABCdef...   # 改成你的真实 Token
-  - SUPER_ADMIN=987654321        # 改成你的数字 ID
-  - DL_BASE_PATH=/downloads      # 容器内下载目录
+```bash
+cat > .env << 'EOF'
+BOT_TOKEN=你的Telegram_Bot_Token
+SUPER_ADMIN=你的数字ID
+EOF
 ```
+
+> 也可以 `nano .env` 手动编辑。`.env` 不进版本库、不进镜像，只留在服务器上。
 
 再把下载目录的**宿主机路径**改成你的实际路径（冒号右边的容器内路径 `/downloads` 保持不变）：
 
@@ -40,7 +41,7 @@ volumes:
   - /vol4/1000/影视/tdl:/downloads
 ```
 
-构建并启动：
+镜像由 GitHub Actions 自动构建并推送到 Docker Hub 公开仓库 `ylgy007/tdl-downloader`，直接拉取即可，**无需本地构建**：
 
 ```bash
 docker compose up -d
@@ -130,11 +131,15 @@ docker compose up -d
 ## 文件结构
 
 ```
+├── .github/workflows/docker-publish.yml   # 自动构建并推送镜像到 Docker Hub
 ├── Dockerfile
 ├── docker-compose.yml
 ├── tdl.py             # 机器人主程序
 ├── requirements.txt
+├── .env.example       # 密钥示例（复制为 .env 填入真实值）
 ├── .gitignore
+├── .dockerignore
+├── RELEASE_NOTES.md
 └── README.md
 ```
 

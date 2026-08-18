@@ -1,0 +1,22 @@
+services:
+  tdl-downloader:
+    build: .
+    container_name: tdl-downloader
+    restart: always
+    network_mode: "host"
+    environment:
+      # ⚠️ 部署前把下面两个占位值改成真实值（Bot Token / 你的数字 ID）
+      - BOT_TOKEN=123456:ABCdef...
+      - SUPER_ADMIN=987654321
+      - DL_BASE_PATH=/downloads
+    volumes:
+      # 持久化 TDL 登录会话，重启容器不会掉线
+      - tdl-sessions:/root/.tdl
+      # 持久化机器人运行时数据
+      - bot-data:/app/data
+      # NAS 下载目录（宿主机路径:容器内路径）
+      - /vol4/1000/影视/tdl:/downloads
+
+volumes:
+  tdl-sessions:
+  bot-data:

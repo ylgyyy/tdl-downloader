@@ -529,7 +529,7 @@ def _ext_bottom_keyboard(chat_id):
 @admin_required
 def btn_dl_ext(msg):
     user_steps[msg.chat.id] = {"step": "SELECTING_EXT"}
-    bot.send_message(msg.chat.id, "📎 *选择下载类型*（可多选）\n点击格式切换选择", reply_markup=_ext_inline_keyboard(msg.chat.id), parse_mode="HTML")
+    bot.send_message(msg.chat.id, "📎 选择下载类型（可多选）\n点击格式切换选择", reply_markup=_ext_inline_keyboard(msg.chat.id), parse_mode="HTML")
     bot.send_message(msg.chat.id, "操作：", reply_markup=_ext_bottom_keyboard(msg.chat.id))
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("ext_"))
@@ -563,7 +563,7 @@ def handle_ext_callback(call):
             current.add(e)
         user_dl_ext[str(chat_id)] = ",".join(sorted(current))
         save_user_dl_ext()
-        return bot.edit_message_text("📎 *选择下载类型*（可多选）", chat_id, call.message.message_id, reply_markup=_ext_inline_keyboard(chat_id), parse_mode="HTML")
+        return bot.edit_message_text("📎 选择下载类型（可多选）", chat_id, call.message.message_id, reply_markup=_ext_inline_keyboard(chat_id), parse_mode="HTML")
 
 # ==========================
 # 单文件下载重命名确认（内联按钮回调）
@@ -643,7 +643,7 @@ def _run_task(task):
 
     # Step 1/2: 导出（先清理残留进程）
     _kill_stale_tdl()
-    step_msg = bot.send_message(task.chat_id, f"📥 *{label}*\n\n📡 Step 1/2: 导出消息...", parse_mode="HTML")
+    step_msg = bot.send_message(task.chat_id, f"📥 {label}\n\n📡 Step 1/2: 导出消息...", parse_mode="HTML")
     task.step_msg_id = step_msg.message_id
 
     if task.kind == "single":
@@ -689,7 +689,7 @@ def _run_task(task):
     except Exception:
         task.before_files = set()
 
-    bot.edit_message_text(f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...",
+    bot.edit_message_text(f"📥 {label}\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...",
                           task.chat_id, step_msg.message_id, parse_mode="HTML")
 
     dl_argv = ["tdl", "-n", task.tdl_name, "dl", "-f", task.export_file, "-t", "16",
@@ -725,9 +725,9 @@ def _run_task(task):
                 tail = f"📦 {_format_size(cur_size)}  ⚡ {speed_str}"
                 if task.kind == "multi":
                     tail += f"  ✅ {done}/{total}"
-                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n{tail}\n\n{queue_line}"
+                text = f"📥 {label}\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n{tail}\n\n{queue_line}"
             else:
-                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接...\n\n{queue_line}"
+                text = f"📥 {label}\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接...\n\n{queue_line}"
             bot.edit_message_text(text, task.chat_id, step_msg.message_id, parse_mode="HTML")
         except Exception:
             pass
@@ -966,7 +966,7 @@ def handle_steps(msg):
             child.send("\x1b[24;1R")
 
             data["step"] = "LOGIN_CODE"
-            bot.send_message(chat_id, "📩 Telegram 官方已向您的设备发送了验证码。\n👉 **请输入验证码**：")
+            bot.send_message(chat_id, "📩 Telegram 官方已向您的设备发送了验证码。\n👉 请输入验证码：")
 
         except pexpect.TIMEOUT:
             safe_out = str(child.before).replace('<', '[').replace('>', ']')
@@ -1001,7 +1001,7 @@ def handle_steps(msg):
                 elif index == 1:
                     # 匹配到需要输入密码
                     data["step"] = "LOGIN_PASSWORD"
-                    bot.send_message(chat_id, "🔒 此账号开启了两步验证(2FA)。\n👉 **请输入两步验证密码**：")
+                    bot.send_message(chat_id, "🔒 此账号开启了两步验证(2FA)。\n👉 请输入两步验证密码：")
                     break # 跳出循环
 
                 elif index == 2 or index == 3:

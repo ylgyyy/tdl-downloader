@@ -13,6 +13,7 @@ services:
       BOT_TOKEN: "123456:ABCdef..."
       SUPER_ADMIN: "987654321"
       DL_BASE_PATH: /downloads
+      MAX_CONCURRENT_DL: "2"        # 同时下载的最大任务数
 
     volumes:
       # 持久化 TDL 登录会话，重启容器不会掉线

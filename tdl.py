@@ -598,7 +598,7 @@ def _format_size(size_bytes):
 
 
 def _format_file_list(dl_dir, names):
-    """生成带大小的文件列表（最多显示 20 个），返回 (文本, 总大小)"""
+    """生成文件列表（最多显示 20 个），返回 (文本, 总大小)"""
     lines = []
     total_size = 0
     for f in names:
@@ -608,7 +608,7 @@ def _format_file_list(dl_dir, names):
             sz = 0
         total_size += sz
         if len(lines) < 20:
-            lines.append(f"{f}  ({_format_size(sz)})")
+            lines.append(f)
     if len(names) > 20:
         lines.append(f"... 还有 {len(names) - 20} 个文件")
     return ("\n".join(lines) if lines else "（无可列出的文件）"), total_size

@@ -720,13 +720,14 @@ def _run_task(task):
         last_size = cur_size
         last_time = now
         try:
+            queue_line = f"📊 {queue.status_text(task.chat_id)}"
             if tmp_count > 0:
                 tail = f"📦 {_format_size(cur_size)}  ⚡ {speed_str}"
                 if task.kind == "multi":
                     tail += f"  ✅ {done}/{total}"
-                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n{tail}"
+                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n{tail}\n\n{queue_line}"
             else:
-                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接..."
+                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接...\n\n{queue_line}"
             bot.edit_message_text(text, task.chat_id, step_msg.message_id, parse_mode="HTML")
         except Exception:
             pass

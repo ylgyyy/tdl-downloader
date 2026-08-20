@@ -3,11 +3,13 @@ import json
 import subprocess
 import os
 import threading
+import time
 import telebot
 import pexpect
 from time import sleep
 from functools import wraps
 from telebot.types import BotCommand
+from download_queue import DownloadTask, DownloadQueue
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SUPER_ADMIN_RAW = os.environ.get("SUPER_ADMIN", "")
@@ -16,6 +18,7 @@ if not DL_BASE_PATH:
     print("❌ 未设置 DL_BASE_PATH 环境变量！请在 docker-compose.yml 中配置下载目录。")
     exit(1)
 TDL_PROXY = os.environ.get("TDL_PROXY", "")  # 代理，如 socks5://192.168.31.2:7891
+MAX_CONCURRENT_DL = int(os.environ.get("MAX_CONCURRENT_DL", "2") or 2)
 
 if not BOT_TOKEN or not SUPER_ADMIN_RAW:
     print("❌ 未设置 BOT_TOKEN 或 SUPER_ADMIN 环境变量！")
@@ -42,8 +45,6 @@ user_steps = {}
 # 存储正在登录的子进程 {chat_id: pexpect_child}
 active_logins = {}
 
-# 存储正在下载的子进程 {chat_id: subprocess.Popen}
-active_downloads = {}
 # 当前正在运行、由本程序启动的 tdl 子进程 PID（_kill_stale_tdl 会跳过这些，避免误杀）
 _running_tdl_pids = set()
 
@@ -176,12 +177,7 @@ def _kill_stale_tdl():
     """杀掉孤儿 tdl 进程（本程序当前任务之外的），释放数据库锁，避免误杀进行中的下载/登录"""
     # 收集本程序当前仍存活的 tdl 进程 PID，跳过它们
     protected = set(_running_tdl_pids)
-    for proc in list(active_downloads.values()):
-        try:
-            if proc.poll() is None:
-                protected.add(proc.pid)
-        except Exception:
-            pass
+    protected |= queue.running_pids()
     for child in list(active_logins.values()):
         try:
             if child.isalive():
@@ -344,9 +340,6 @@ def main_menu(chat_id):
     if chat_id in active_logins:
         active_logins[chat_id].close(force=True)
         del active_logins[chat_id]
-    if chat_id in active_downloads:
-        active_downloads[chat_id].kill()
-        del active_downloads[chat_id]
 
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn1 = telebot.types.KeyboardButton("📥 单文件下载")
@@ -620,6 +613,15 @@ def _format_file_list(dl_dir, names):
         lines.append(f"... 还有 {len(names) - 20} 个文件")
     return ("\n".join(lines) if lines else "（无可列出的文件）"), total_size
 
+def _cleanup_tmp(dl_dir):
+    """删除目录中的 .tmp 残留文件"""
+    try:
+        for f in os.listdir(dl_dir):
+            if f.endswith(".tmp"):
+                os.remove(os.path.join(dl_dir, f))
+    except Exception:
+        pass
+
 def _get_dl_progress(dl_dir):
     """获取当前正在下载的文件大小（监控 .tmp 文件）"""
     try:
@@ -635,85 +637,188 @@ def _get_dl_progress(dl_dir):
         return 0, "0 KB", 0
 
 
-def _watch_single_download(chat_id, process, dl_dir, link, tdl_name, msg_id, total, rename_name=None, before_files=None):
-    """后台线程：等待单文件下载完成，显示文件大小增长和速度"""
-    import time
+def _run_task(task):
+    """在独立线程中执行一个下载任务：export → dl → 轮询进度 → 收尾。"""
+    label = "单文件下载" if task.kind == "single" else "批量下载"
+
+    # Step 1/2: 导出（先清理残留进程）
+    _kill_stale_tdl()
+    step_msg = bot.send_message(task.chat_id, f"📥 *{label}*\n\n📡 Step 1/2: 导出消息...", parse_mode="HTML")
+    task.step_msg_id = step_msg.message_id
+
+    if task.kind == "single":
+        task.export_file = f"single-export_{task.chat_id}_{task.task_id}.json"
+        export_argv = ["tdl", "-n", task.tdl_name, "chat", "export", "-c", task.channel_id,
+                       "-i", f"{task.msg_id},{task.msg_id}", "-T", "id", "-o", task.export_file]
+        total = 1
+    else:
+        task.export_file = f"dl-export_{task.chat_id}_{task.task_id}.json"
+        export_argv = ["tdl", "-n", task.tdl_name, "chat", "export", "-c", task.source_id,
+                       "-i", f"{task.start_id},{task.end_id}", "-T", "id", "-o", task.export_file]
+        total = 1
+    if TDL_PROXY:
+        export_argv += ["--proxy", TDL_PROXY]
+    success, _, stderr, _ = run_command(export_argv, task.chat_id)
+
+    if task.canceled:
+        queue._finish(task)
+        return
+    if not success:
+        bot.edit_message_text(f"❌ 导出失败：{stderr[:200]}", task.chat_id, step_msg.message_id)
+        queue._finish(task)
+        return
+
+    if task.kind == "multi":
+        file_ok, file_msg = check_export_file(task.export_file)
+        if not file_ok:
+            bot.edit_message_text(f"❌ {file_msg}", task.chat_id, step_msg.message_id)
+            if os.path.exists(task.export_file):
+                os.remove(task.export_file)
+            queue._finish(task)
+            return
+        try:
+            with open(task.export_file, "r", encoding="utf-8") as f:
+                total = len(json.load(f).get("messages", []))
+        except Exception:
+            total = 1
+
+    task.dl_dir = f"{DL_BASE_PATH}/{task.channel_id if task.kind == 'single' else task.source_id}"
+    os.makedirs(task.dl_dir, exist_ok=True)
+    try:
+        task.before_files = set(os.listdir(task.dl_dir))
+    except Exception:
+        task.before_files = set()
+
+    bot.edit_message_text(f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...",
+                          task.chat_id, step_msg.message_id, parse_mode="HTML")
+
+    dl_argv = ["tdl", "-n", task.tdl_name, "dl", "-f", task.export_file, "-t", "16",
+               "--pool", "0", "-d", task.dl_dir, "--rewrite-ext", "--reconnect-timeout", "0"]
+    ext = get_user_ext(task.chat_id)
+    if ext:
+        dl_argv += ["-i", ext]
+    dl_argv += ["--template", "{{ .FileName }}"]
+    if TDL_PROXY:
+        dl_argv += ["--proxy", TDL_PROXY]
+    task.process = subprocess.Popen(dl_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+
     last_size = 0
     last_time = time.time()
-    while process.poll() is None:
-        sleep(3)
-        tmp_count, size_str, done = _get_dl_progress(dl_dir)
-        # 获取当前 .tmp 文件的实际字节数
+    while task.process.poll() is None and not task.canceled:
+        time.sleep(3)
+        tmp_count, _, done = _get_dl_progress(task.dl_dir)
         try:
             cur_size = 0
-            for f in os.listdir(dl_dir):
+            for f in os.listdir(task.dl_dir):
                 if f.endswith(".tmp"):
-                    cur_size += os.path.getsize(os.path.join(dl_dir, f))
+                    cur_size += os.path.getsize(os.path.join(task.dl_dir, f))
         except Exception:
             cur_size = 0
-
         now = time.time()
         elapsed = now - last_time
-        if elapsed > 0 and cur_size > last_size:
-            speed = (cur_size - last_size) / elapsed
-            speed_str = _format_size(speed) + "/s"
-        else:
-            speed_str = "..."
-
+        speed_str = _format_size((cur_size - last_size) / elapsed) + "/s" if elapsed > 0 and cur_size > last_size else "..."
         last_size = cur_size
         last_time = now
-
         try:
             if tmp_count > 0:
-                bot.edit_message_text(
-                    f"📥 *单文件下载*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n📦 {_format_size(cur_size)}  ⚡ {speed_str}",
-                    chat_id, msg_id, parse_mode="HTML"
-                )
+                tail = f"📦 {_format_size(cur_size)}  ⚡ {speed_str}"
+                if task.kind == "multi":
+                    tail += f"  ✅ {done}/{total}"
+                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n{tail}"
             else:
-                bot.edit_message_text(
-                    f"📥 *单文件下载*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接...",
-                    chat_id, msg_id, parse_mode="HTML"
-                )
+                text = f"📥 *{label}*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接..."
+            bot.edit_message_text(text, task.chat_id, step_msg.message_id, parse_mode="HTML")
         except Exception:
             pass
 
-    was_canceled = chat_id not in active_downloads  # 被 /cancel 提前清理了
-    if chat_id in active_downloads:
-        del active_downloads[chat_id]
-    user_steps.pop(chat_id, None)
+    if task.kind == "multi" and os.path.exists(task.export_file):
+        os.remove(task.export_file)
 
-    if was_canceled:
-        return  # /cancel 已经处理了，不再发消息
+    if task.canceled:
+        _cleanup_tmp(task.dl_dir)
+        queue._finish(task)
+        return
 
-    if process.returncode == 0:
-        renamed = _rename_new_files(dl_dir, before_files, rename_name)  # None=未重命名，保留原逻辑
-        try:
-            if renamed is not None:
-                names = renamed
-            else:
-                # 未重命名时，识别本次新下载的文件（排除下载前已存在的）
-                after_files = set(os.listdir(dl_dir))
-                names = sorted(after_files - set(before_files or []))
-                names = [f for f in names if not f.startswith('.') and not f.endswith('.tmp')]
-            file_list, total_size = _format_file_list(dl_dir, names)
-        except Exception:
-            file_list, total_size = "无法列出文件", 0
-        bot.send_message(chat_id, f"""✅ 单文件下载完成！
-📥 链接：{link}
-📁 保存目录：{dl_dir}/
-🔑 使用TDL账号：@{tdl_name}
+    if task.process.returncode == 0:
+        if task.kind == "single":
+            renamed = _rename_new_files(task.dl_dir, task.before_files, task.rename_name)
+            try:
+                if renamed is not None:
+                    names = renamed
+                else:
+                    after_files = set(os.listdir(task.dl_dir))
+                    names = sorted(after_files - set(task.before_files or []))
+                    names = [f for f in names if not f.startswith('.') and not f.endswith('.tmp')]
+                file_list, total_size = _format_file_list(task.dl_dir, names)
+            except Exception:
+                file_list, total_size = "无法列出文件", 0
+            bot.send_message(task.chat_id, f"""✅ 单文件下载完成！
+📥 链接：{task.link}
+📁 保存目录：{task.dl_dir}/
+🔑 使用TDL账号：@{task.tdl_name}
 📦 下载大小：{_format_size(total_size)}
 📂 下载文件：
 {file_list}""")
+        else:
+            try:
+                files = os.listdir(task.dl_dir)
+                file_list = "\n".join(files[:20]) if files else "（无可列出的文件）"
+                if len(files) > 20:
+                    file_list += f"\n... 还有 {len(files) - 20} 个文件"
+            except Exception:
+                file_list = "无法列出文件"
+            bot.send_message(task.chat_id, f"""✅ 批量下载完成！
+📥 源链接：{task.source_link} → 源频道ID：{task.source_id}
+🆔 消息ID范围：{task.start_id}-{task.end_id}
+📁 保存目录：{task.dl_dir}/
+🔑 使用TDL账号：@{task.tdl_name}
+📂 下载文件：
+{file_list}""")
     else:
-        try:
-            for f in os.listdir(dl_dir):
-                if f.endswith(".tmp"):
-                    os.remove(os.path.join(dl_dir, f))
-        except Exception:
-            pass
-        bot.send_message(chat_id, f"❌ 下载失败！\n🔑 使用TDL账号：@{tdl_name}")
-    main_menu(chat_id)
+        _cleanup_tmp(task.dl_dir)
+        bot.send_message(task.chat_id, f"❌ 下载失败！\n🔑 使用TDL账号：@{task.tdl_name}")
+    queue._finish(task)
+
+
+def do_single_download(chat_id, channel_id, msg_id, link, rename_name=None):
+    """把单文件下载任务提交到队列。"""
+    cid_str = str(chat_id)
+    tdl_name = user_current_tdl.get(cid_str)
+    user_accounts = TDL_ACCOUNTS.get(cid_str, [])
+    if not tdl_name and user_accounts:
+        tdl_name = user_accounts[0]
+    if not tdl_name:
+        bot.send_message(chat_id, "❌ 严重错误：未找到您的专属 TDL 账号！")
+        user_steps.pop(chat_id, None)
+        main_menu(chat_id)
+        return
+    task = DownloadTask(task_id=0, chat_id=chat_id, tdl_name=tdl_name, kind="single",
+                        channel_id=channel_id, msg_id=msg_id, link=link, rename_name=rename_name)
+    queue.submit(task)
+    bot.send_message(chat_id, f"✅ 已加入下载队列\n{queue.status_text(chat_id)}")
+    user_steps.pop(chat_id, None)
+
+
+def do_multi_download(chat_id, source_id, source_link, start_id, end_id):
+    """把批量下载任务提交到队列。"""
+    cid_str = str(chat_id)
+    tdl_name = user_current_tdl.get(cid_str)
+    user_accounts = TDL_ACCOUNTS.get(cid_str, [])
+    if not tdl_name and user_accounts:
+        tdl_name = user_accounts[0]
+    if not tdl_name:
+        bot.send_message(chat_id, "❌ 严重错误：未找到您的专属 TDL 账号！")
+        user_steps.pop(chat_id, None)
+        main_menu(chat_id)
+        return
+    task = DownloadTask(task_id=0, chat_id=chat_id, tdl_name=tdl_name, kind="multi",
+                        source_id=source_id, source_link=source_link, start_id=start_id, end_id=end_id)
+    queue.submit(task)
+    bot.send_message(chat_id, f"✅ 已加入下载队列\n{queue.status_text(chat_id)}")
+    user_steps.pop(chat_id, None)
+
+
+queue = DownloadQueue(MAX_CONCURRENT_DL, _run_task)
 
 def _rename_new_files(dl_dir, before_files, rename_name):
     """下载完成后识别新增文件；指定 rename_name 时重命名（多文件加序号）。
@@ -750,154 +855,16 @@ def _rename_new_files(dl_dir, before_files, rename_name):
     return result
 
 
-def do_single_download(chat_id, channel_id, msg_id, link, rename_name=None):
-    """执行单文件下载。rename_name 为空时保留原文件名。"""
-    dl_dir = f"{DL_BASE_PATH}/{channel_id}"
-    os.makedirs(dl_dir, exist_ok=True)
-
-    cid_str = str(chat_id)
-    tdl_name = user_current_tdl.get(cid_str)
-    user_accounts = TDL_ACCOUNTS.get(cid_str, [])
-    if not tdl_name and user_accounts:
-        tdl_name = user_accounts[0]
-    if not tdl_name:
-        bot.send_message(chat_id, "❌ 严重错误：未找到您的专属 TDL 账号！")
-        user_steps.pop(chat_id, None)
-        main_menu(chat_id)
-        return
-
-    export_file = f"single-export_{chat_id}.json"
-
-    # Step 1/2: 导出（先清理残留进程防止数据库锁冲突）
-    _kill_stale_tdl()
-    step_msg = bot.send_message(chat_id, f"📥 *单文件下载*\n\n📡 Step 1/2: 导出消息...", parse_mode="HTML")
-
-    export_argv = ["tdl", "-n", tdl_name, "chat", "export", "-c", channel_id, "-i", f"{msg_id},{msg_id}", "-T", "id", "-o", export_file]
-    if TDL_PROXY:
-        export_argv += ["--proxy", TDL_PROXY]
-    success, stdout, stderr, _ = run_command(export_argv, chat_id)
-
-    if not success:
-        bot.edit_message_text(f"❌ 导出失败：{stderr[:200]}", chat_id, step_msg.message_id)
-        user_steps.pop(chat_id, None)
-        main_menu(chat_id)
-        return
-
-    # Step 2/2: 下载
-    bot.edit_message_text(f"📥 *单文件下载*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...", chat_id, step_msg.message_id, parse_mode="HTML")
-
-    # 下载前快照目录已有文件，用于下载完成后识别新增文件并重命名
-    try:
-        before_files = set(os.listdir(dl_dir))
-    except Exception:
-        before_files = set()
-
-    dl_argv = ["tdl", "-n", tdl_name, "dl", "-f", export_file, "-t", "16", "--pool", "0", "-d", dl_dir, "--rewrite-ext", "--reconnect-timeout", "0"]
-    ext = get_user_ext(chat_id)
-    if ext:
-        dl_argv += ["-i", ext]
-    dl_argv += ["--template", "{{ .FileName }}"]
-    if TDL_PROXY:
-        dl_argv += ["--proxy", TDL_PROXY]
-    process = subprocess.Popen(dl_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-    active_downloads[chat_id] = process
-    if chat_id in user_steps:
-        user_steps[chat_id]["step"] = "DOWNLOADING"
-
-    t = threading.Thread(target=_watch_single_download, args=(chat_id, process, dl_dir, link, tdl_name, step_msg.message_id, 1, rename_name, before_files))
-    t.start()
-
-
-def _watch_multi_download(chat_id, process, dl_dir, source_link, source_id, start_id, end_id, tdl_name, export_file, msg_id, total):
-    """后台线程：等待批量下载完成，显示文件大小增长和速度"""
-    import time
-    last_size = 0
-    last_time = time.time()
-    while process.poll() is None:
-        sleep(3)
-        tmp_count, size_str, done = _get_dl_progress(dl_dir)
-        try:
-            cur_size = 0
-            for f in os.listdir(dl_dir):
-                if f.endswith(".tmp"):
-                    cur_size += os.path.getsize(os.path.join(dl_dir, f))
-        except Exception:
-            cur_size = 0
-
-        now = time.time()
-        elapsed = now - last_time
-        if elapsed > 0 and cur_size > last_size:
-            speed_str = _format_size((cur_size - last_size) / elapsed) + "/s"
-        else:
-            speed_str = "..."
-        last_size = cur_size
-        last_time = now
-
-        try:
-            if tmp_count > 0:
-                bot.edit_message_text(
-                    f"📥 *批量下载*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...\n\n📦 {_format_size(cur_size)}  ⚡ {speed_str}  ✅ {done}/{total}",
-                    chat_id, msg_id, parse_mode="HTML"
-                )
-            else:
-                bot.edit_message_text(
-                    f"📥 *批量下载*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 等待连接...",
-                    chat_id, msg_id, parse_mode="HTML"
-                )
-        except Exception:
-            pass
-
-    was_canceled = chat_id not in active_downloads
-    if chat_id in active_downloads:
-        del active_downloads[chat_id]
-    user_steps.pop(chat_id, None)
-
-    if os.path.exists(export_file):
-        os.remove(export_file)
-
-    if was_canceled:
-        return
-
-    if process.returncode == 0:
-        try:
-            files = os.listdir(dl_dir)
-            file_list = "\n".join(files[:20]) if files else "（无可列出的文件）"
-            if len(files) > 20:
-                file_list += f"\n... 还有 {len(files) - 20} 个文件"
-        except Exception:
-            file_list = "无法列出文件"
-        bot.send_message(chat_id, f"""✅ 批量下载完成！
-📥 源链接：{source_link} → 源频道ID：{source_id}
-🆔 消息ID范围：{start_id}-{end_id}
-📁 保存目录：{dl_dir}/
-🔑 使用TDL账号：@{tdl_name}
-📂 下载文件：
-{file_list}""")
-    else:
-        try:
-            for f in os.listdir(dl_dir):
-                if f.endswith(".tmp"):
-                    os.remove(os.path.join(dl_dir, f))
-        except Exception:
-            pass
-        bot.send_message(chat_id, f"❌ 下载失败！\n🔑 使用TDL账号：@{tdl_name}")
-    main_menu(chat_id)
-
 @bot.message_handler(commands=['cancel'])
 def cmd_cancel(msg):
-    """取消当前操作：下载/登录/任何进行中的任务"""
+    """取消当前操作：该用户全部下载任务 + 登录/任何进行中的输入"""
     chat_id = msg.chat.id
-    # 取消下载
-    if chat_id in active_downloads:
-        active_downloads[chat_id].kill()
-        del active_downloads[chat_id]
-    _kill_stale_tdl()  # 确保释放数据库锁
-    # 取消登录
+    n = queue.cancel_all(chat_id)
     if chat_id in active_logins:
         active_logins[chat_id].close(force=True)
         del active_logins[chat_id]
     user_steps.pop(chat_id, None)
-    bot.send_message(chat_id, "❌ 已取消当前操作")
+    bot.send_message(chat_id, f"❌ 已取消 {n} 个下载任务")
     main_menu(chat_id)
 
 @bot.message_handler(func=lambda msg: msg.text == "❌ 取消")
@@ -1174,72 +1141,7 @@ def handle_steps(msg):
             del user_steps[chat_id]
             main_menu(chat_id)
             return
-
-        source_id = data["source_id"]
-        source_link = data["source_link"]
-        start_id = data["start_id"]
-        end_id = end_msg_id
-        dl_dir = f"{DL_BASE_PATH}/{source_id}"
-        export_file = f"dl-export_{chat_id}.json"
-        os.makedirs(dl_dir, exist_ok=True)
-
-        cid_str = str(chat_id)
-        tdl_name = user_current_tdl.get(cid_str)
-        user_accounts = TDL_ACCOUNTS.get(cid_str, [])
-        if not tdl_name and user_accounts:
-            tdl_name = user_accounts[0]
-        if not tdl_name:
-            bot.send_message(chat_id, "❌ 严重错误：未找到您的专属 TDL 账号！")
-            del user_steps[chat_id]
-            main_menu(chat_id)
-            return
-
-        # Step 1/2: 导出（先清理残留进程防止数据库锁冲突）
-        _kill_stale_tdl()
-        step_msg = bot.send_message(chat_id, f"📥 *批量下载*\n\n📡 Step 1/2: 导出消息...", parse_mode="HTML")
-
-        export_argv = ["tdl", "-n", tdl_name, "chat", "export", "-c", source_id, "-i", f"{start_id},{end_id}", "-T", "id", "-o", export_file]
-        success, stdout, stderr, _ = run_command(export_argv, chat_id)
-
-        if not success:
-            bot.edit_message_text(f"❌ 导出失败：{stderr[:200]}", chat_id, step_msg.message_id)
-            del user_steps[chat_id]
-            main_menu(chat_id)
-            return
-
-        file_ok, file_msg = check_export_file(export_file)
-        if not file_ok:
-            bot.edit_message_text(f"❌ {file_msg}", chat_id, step_msg.message_id)
-            if os.path.exists(export_file):
-                os.remove(export_file)
-            del user_steps[chat_id]
-            main_menu(chat_id)
-            return
-
-        # Step 2/2: 下载
-        bot.edit_message_text(f"📥 *批量下载*\n\n📡 Step 1/2: ✅\n⬇️ Step 2/2: 下载文件中...", chat_id, step_msg.message_id, parse_mode="HTML")
-
-        dl_argv = ["tdl", "-n", tdl_name, "dl", "-f", export_file, "-t", "16", "--pool", "0", "-d", dl_dir, "--rewrite-ext", "--reconnect-timeout", "0"]
-        ext = get_user_ext(chat_id)
-        if ext:
-            dl_argv += ["-i", ext]
-        dl_argv += ["--template", "{{ .FileName }}"]
-        if TDL_PROXY:
-            dl_argv += ["--proxy", TDL_PROXY]
-        process = subprocess.Popen(dl_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
-        active_downloads[chat_id] = process
-        data["step"] = "DOWNLOADING"
-
-        # 统计导出文件中的媒体总数（用于进度条）
-        try:
-            with open(export_file, "r") as f:
-                export_data = json.load(f)
-            total_files = len(export_data.get("messages", []))
-        except Exception:
-            total_files = 1
-
-        t = threading.Thread(target=_watch_multi_download, args=(chat_id, process, dl_dir, source_link, source_id, start_id, end_id, tdl_name, export_file, step_msg.message_id, total_files))
-        t.start()
+        do_multi_download(chat_id, data["source_id"], data["source_link"], data["start_id"], end_msg_id)
 
     # ================= 选择下载类型 =================
     elif step == "SELECTING_EXT":
@@ -1273,10 +1175,6 @@ def handle_steps(msg):
         bot.send_message(chat_id, f"✅ 下载类型已更新: {ext}")
         del user_steps[chat_id]
         main_menu(chat_id)
-
-    # ================= 下载中（等待完成或取消） =================
-    elif step == "DOWNLOADING":
-        bot.send_message(chat_id, "⏳ 下载正在进行中... 发送 /cancel 或点击 ❌ 取消 可中止")
 
 # ==========================
 # 直接发送链接下载（单文件）

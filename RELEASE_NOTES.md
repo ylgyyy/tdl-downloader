@@ -1,3 +1,3 @@
-# v1.2.2
+# v1.2.3
 
-- 修复：并发下载时同账号任务可能同时启动、导致 tdl 数据库锁冲突（`Current database is used by another process`）
+- 优化：修正 `docker-compose.yml` 中 `MAX_CONCURRENT_DL` 的注释说明（跨账号最大并发；同账号始终串行）

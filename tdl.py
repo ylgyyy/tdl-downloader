@@ -951,6 +951,7 @@ def handle_steps(msg):
             save_tdl_accounts()
             user_current_tdl[cid_str] = name
             save_user_current_tdl()
+            login_log.info("账号 @%s 绑定到用户 %s", name, chat_id)
             bot.send_message(chat_id, f"✅ 成功将 TDL 账号 @{name} 绑定到您的名下！")
         open_user_manager(chat_id)
         del user_steps[chat_id]
@@ -970,6 +971,7 @@ def handle_steps(msg):
             if user_current_tdl.get(cid_str) == name:
                 del user_current_tdl[cid_str]
                 save_user_current_tdl()
+            login_log.info("账号 @%s 从用户 %s 删除", name, chat_id)
             bot.send_message(chat_id, f"✅ 已从您的名下删除 TDL 账号：@{name}")
         open_user_manager(chat_id)
         del user_steps[chat_id]
@@ -995,6 +997,7 @@ def handle_steps(msg):
     elif step == "LOGIN_PHONE":
         phone = msg.text.strip()
         tdl_name = data["tdl_name"]
+        login_log.info("用户 %s 开始登录账号 @%s（手机号 %s）", chat_id, tdl_name, redact_phone(phone))
 
         bot.send_message(chat_id, f"🔄 正在启动 TDL，请求发送验证码到 {phone}...")
         try:
@@ -1021,14 +1024,17 @@ def handle_steps(msg):
             # 为了防止卡在验证码输入前，不管三七二十一，盲补一发坐标
             child.send("\x1b[24;1R")
 
+            login_log.info("账号 @%s 验证码已请求发送", tdl_name)
             data["step"] = "LOGIN_CODE"
             bot.send_message(chat_id, "📩 Telegram 官方已向您的设备发送了验证码。\n👉 请输入验证码：")
 
         except pexpect.TIMEOUT:
+            login_log.warning("账号 @%s 登录请求超时", tdl_name)
             safe_out = str(child.before).replace('<', '[').replace('>', ']')
             bot.send_message(chat_id, f"❌ 请求超时！\n终端截获：\n{safe_out}")
             _cleanup_login(chat_id)
         except Exception as e:
+            login_log.warning("账号 @%s 启动登录失败: %s", tdl_name, e)
             safe_error = str(e).replace('<', '[').replace('>', ']')
             bot.send_message(chat_id, f"❌ 启动登录失败：\n{safe_error}")
             _cleanup_login(chat_id)
@@ -1036,6 +1042,7 @@ def handle_steps(msg):
     # 步骤 C：输入验证码
     elif step == "LOGIN_CODE":
         code = msg.text.strip()
+        login_log.info("账号 @%s 提交验证码", data.get("tdl_name"))
         child = active_logins.get(chat_id)
         if not child or not child.isalive():
             bot.send_message(chat_id, "❌ 登录会话已过期或中断，请重试。")
@@ -1063,6 +1070,7 @@ def handle_steps(msg):
                 elif index == 2 or index == 3:
                     # 匹配到成功或进程结束(EOF)，说明登录完成了！
                     sleep(2)
+                    login_log.info("账号 @%s 登录成功", data["tdl_name"])
                     _bind_tdl_account(chat_id, data["tdl_name"])
                     child.close(force=True)
                     del active_logins[chat_id]
@@ -1078,6 +1086,7 @@ def handle_steps(msg):
     # 步骤 D：输入两步验证密码
     elif step == "LOGIN_PASSWORD":
         password = msg.text.strip()
+        login_log.info("账号 @%s 提交2FA密码", data.get("tdl_name"))
         child = active_logins.get(chat_id)
 
         bot.send_message(chat_id, "🔄 正在验证密码...")
@@ -1091,6 +1100,7 @@ def handle_steps(msg):
                     child.send("\x1b[24;1R") # 补喂坐标
                 elif index == 1 or index == 2:
                     sleep(2)
+                    login_log.info("账号 @%s 2FA验证通过，登录成功", data["tdl_name"])
                     _bind_tdl_account(chat_id, data["tdl_name"],
                                       f"✅ 两步验证通过！登录成功！账号 @{data['tdl_name']} 已绑定并设为您当前的专属账号。")
                     child.close(force=True)
@@ -1099,6 +1109,7 @@ def handle_steps(msg):
                     open_user_manager(chat_id)
                     break
         except Exception:
+            login_log.warning("账号 @%s 密码错误或登录失败", data.get("tdl_name"))
             bot.send_message(chat_id, "❌ 密码错误或登录失败。")
             _cleanup_login(chat_id)
 
@@ -1263,6 +1274,7 @@ def switch_tdl_account(msg):
 
     user_current_tdl[cid_str] = name
     save_user_current_tdl()
+    login_log.info("用户 %s 切换账号到 @%s", cid_str, name)
     bot.send_message(msg.chat.id, f"✅ TDL账号已切换至您的专属账号：@{name}")
     open_user_manager(msg.chat.id)
 

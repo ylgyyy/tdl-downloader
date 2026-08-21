@@ -199,6 +199,7 @@ def _kill_stale_tdl():
         except Exception:
             pass
 
+    killed = 0
     try:
         for p in os.listdir("/proc"):
             if not p.isdigit():
@@ -211,10 +212,13 @@ def _kill_stale_tdl():
                     cmdline = f.read()
                 if b"tdl" in cmdline:
                     os.kill(pid, 9)
+                    killed += 1
             except Exception:
                 pass
     except Exception:
         pass
+    if killed:
+        download_log.info("清理孤儿 tdl 进程 %d 个", killed)
 
 def extract_channel_and_msg_id_from_link(link):
     link = link.strip()
@@ -254,11 +258,14 @@ def run_command(argv, chat_id, task=None):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+            download_log.warning("tdl 命令超时（300s）：%s", " ".join(argv))
             return False, "", "操作超时（5分钟），请减少消息数量重试", tdl_name
         # 合并 stdout/stderr，tdl 可能把错误打到 stdout
         error_msg = (stderr + stdout).strip()
         if not error_msg:
             error_msg = f"退出码: {proc.returncode}"
+        if proc.returncode != 0:
+            download_log.debug("tdl 命令退出码 %s：%s", proc.returncode, " ".join(argv))
         return proc.returncode == 0, stdout, error_msg, tdl_name
     except Exception as e:
         return False, "", str(e), tdl_name
@@ -656,9 +663,11 @@ def _get_dl_progress(dl_dir):
 def _run_task(task):
     """在独立线程中执行一个下载任务：export → dl → 轮询进度 → 收尾。
     任何异常都走 finally 收尾，保证任务不会卡在 running 里无法取消。"""
+    queue_log.info("[任务#%d] 开始运行 %s", task.task_id, task.kind)
     try:
         _run_task_body(task)
     except Exception as e:
+        download_log.exception("[任务#%d] 异常终止", task.task_id)
         try:
             bot.send_message(task.chat_id, f"❌ 任务异常终止：{str(e)[:200]}")
         except Exception:
@@ -670,6 +679,7 @@ def _run_task(task):
         except Exception:
             pass
         queue._finish(task)
+        queue_log.info("[任务#%d] 收尾 %s", task.task_id, queue.status_text(task.chat_id))
 
 
 def _run_task_body(task):
@@ -677,6 +687,7 @@ def _run_task_body(task):
 
     # Step 1/2: 导出（先清理残留进程）
     _kill_stale_tdl()
+    download_log.info("[任务#%d] Step1 导出消息（账号 @%s）", task.task_id, task.tdl_name)
     step_msg = bot.send_message(task.chat_id, f"📥 {label}\n\n📡 Step 1/2: 导出消息...", parse_mode="HTML")
     task.step_msg_id = step_msg.message_id
 
@@ -695,10 +706,13 @@ def _run_task_body(task):
     success, _, stderr, _ = run_command(export_argv, task.chat_id, task)
 
     if task.canceled:
+        download_log.info("[任务#%d] 导出阶段被取消", task.task_id)
         return
     if not success:
+        download_log.error("[任务#%d] 导出失败: %s", task.task_id, stderr[:200])
         bot.edit_message_text(f"❌ 导出失败：{stderr[:200]}", task.chat_id, step_msg.message_id)
         return
+    download_log.info("[任务#%d] Step1 导出成功", task.task_id)
 
     if task.kind == "multi":
         file_ok, file_msg = check_export_file(task.export_file)
@@ -733,6 +747,7 @@ def _run_task_body(task):
         dl_argv += ["--proxy", TDL_PROXY]
     if task.canceled:
         return
+    download_log.info("[任务#%d] Step2 下载中（共 %d 条）", task.task_id, total)
     task.process = subprocess.Popen(dl_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
     last_size = 0
@@ -752,6 +767,7 @@ def _run_task_body(task):
         speed_str = _format_size((cur_size - last_size) / elapsed) + "/s" if elapsed > 0 and cur_size > last_size else "..."
         last_size = cur_size
         last_time = now
+        download_log.debug("[任务#%d] 进度: %s 临时%d个", task.task_id, speed_str, tmp_count)
         try:
             queue_line = f"📊 {queue.status_text(task.chat_id)}"
             if tmp_count > 0:
@@ -770,6 +786,7 @@ def _run_task_body(task):
 
     if task.canceled:
         _cleanup_tmp(task.dl_dir)
+        download_log.info("[任务#%d] 下载阶段被取消", task.task_id)
         return
 
     if task.process.returncode == 0:
@@ -783,6 +800,7 @@ def _run_task_body(task):
                     names = sorted(after_files - set(task.before_files or []))
                     names = [f for f in names if not f.startswith('.') and not f.endswith('.tmp')]
                 file_list, total_size = _format_file_list(task.dl_dir, names)
+                download_log.info("[任务#%d] 单文件下载完成 %s", task.task_id, _format_size(total_size))
             except Exception:
                 file_list, total_size = "无法列出文件", 0
             bot.send_message(task.chat_id, f"""✅ 单文件下载完成！
@@ -795,6 +813,7 @@ def _run_task_body(task):
         else:
             try:
                 files = os.listdir(task.dl_dir)
+                download_log.info("[任务#%d] 批量下载完成（%d 个文件）", task.task_id, len(files))
                 file_list = "\n".join(files[:20]) if files else "（无可列出的文件）"
                 if len(files) > 20:
                     file_list += f"\n... 还有 {len(files) - 20} 个文件"
@@ -809,6 +828,7 @@ def _run_task_body(task):
 {file_list}""")
     else:
         _cleanup_tmp(task.dl_dir)
+        download_log.error("[任务#%d] 下载失败（退出码 %s）", task.task_id, task.process.returncode)
         bot.send_message(task.chat_id, f"❌ 下载失败！\n🔑 使用TDL账号：@{task.tdl_name}")
 
 
@@ -827,6 +847,8 @@ def do_single_download(chat_id, channel_id, msg_id, link, rename_name=None):
     task = DownloadTask(task_id=0, chat_id=chat_id, tdl_name=tdl_name, kind="single",
                         channel_id=channel_id, msg_id=msg_id, link=link, rename_name=rename_name)
     queue.submit(task)
+    download_log.info("[任务#%d] 收到单文件下载（账号 @%s，链接 %s）", task.task_id, tdl_name, link)
+    queue_log.info("[任务#%d] 已入队 %s", task.task_id, queue.status_text(chat_id))
     bot.send_message(chat_id, f"✅ 已加入下载队列\n{queue.status_text(chat_id)}")
     user_steps.pop(chat_id, None)
 
@@ -846,6 +868,9 @@ def do_multi_download(chat_id, source_id, source_link, start_id, end_id):
     task = DownloadTask(task_id=0, chat_id=chat_id, tdl_name=tdl_name, kind="multi",
                         source_id=source_id, source_link=source_link, start_id=start_id, end_id=end_id)
     queue.submit(task)
+    download_log.info("[任务#%d] 收到批量下载（账号 @%s，%s[%s-%s]）",
+                      task.task_id, tdl_name, source_id, start_id, end_id)
+    queue_log.info("[任务#%d] 已入队 %s", task.task_id, queue.status_text(chat_id))
     bot.send_message(chat_id, f"✅ 已加入下载队列\n{queue.status_text(chat_id)}")
     user_steps.pop(chat_id, None)
 
@@ -892,6 +917,7 @@ def cmd_cancel(msg):
     """取消当前操作：该用户全部下载任务 + 登录/任何进行中的输入"""
     chat_id = msg.chat.id
     n = queue.cancel_all(chat_id)
+    queue_log.info("用户 %s 取消 %d 个任务", chat_id, n)
     if chat_id in active_logins:
         active_logins[chat_id].close(force=True)
         del active_logins[chat_id]

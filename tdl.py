@@ -213,7 +213,7 @@ def extract_channel_and_msg_id_from_link(link):
     else:
         return None, None
 
-def run_command(argv, chat_id):
+def run_command(argv, chat_id, task=None):
     cid_str = str(chat_id)
     tdl_name = user_current_tdl.get(cid_str)
     user_accounts = TDL_ACCOUNTS.get(cid_str, [])
@@ -231,6 +231,8 @@ def run_command(argv, chat_id):
         stdin=subprocess.DEVNULL,
         encoding="utf-8",
     )
+    if task is not None:
+        task.process = proc  # 让 cancel_all 能 kill 导出进程
     _running_tdl_pids.add(proc.pid)
     try:
         try:
@@ -638,7 +640,25 @@ def _get_dl_progress(dl_dir):
 
 
 def _run_task(task):
-    """在独立线程中执行一个下载任务：export → dl → 轮询进度 → 收尾。"""
+    """在独立线程中执行一个下载任务：export → dl → 轮询进度 → 收尾。
+    任何异常都走 finally 收尾，保证任务不会卡在 running 里无法取消。"""
+    try:
+        _run_task_body(task)
+    except Exception as e:
+        try:
+            bot.send_message(task.chat_id, f"❌ 任务异常终止：{str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        try:
+            if task.process is not None and task.process.poll() is None:
+                task.process.kill()
+        except Exception:
+            pass
+        queue._finish(task)
+
+
+def _run_task_body(task):
     label = "单文件下载" if task.kind == "single" else "批量下载"
 
     # Step 1/2: 导出（先清理残留进程）
@@ -658,14 +678,12 @@ def _run_task(task):
         total = 1
     if TDL_PROXY:
         export_argv += ["--proxy", TDL_PROXY]
-    success, _, stderr, _ = run_command(export_argv, task.chat_id)
+    success, _, stderr, _ = run_command(export_argv, task.chat_id, task)
 
     if task.canceled:
-        queue._finish(task)
         return
     if not success:
         bot.edit_message_text(f"❌ 导出失败：{stderr[:200]}", task.chat_id, step_msg.message_id)
-        queue._finish(task)
         return
 
     if task.kind == "multi":
@@ -674,7 +692,6 @@ def _run_task(task):
             bot.edit_message_text(f"❌ {file_msg}", task.chat_id, step_msg.message_id)
             if os.path.exists(task.export_file):
                 os.remove(task.export_file)
-            queue._finish(task)
             return
         try:
             with open(task.export_file, "r", encoding="utf-8") as f:
@@ -700,6 +717,8 @@ def _run_task(task):
     dl_argv += ["--template", "{{ .FileName }}"]
     if TDL_PROXY:
         dl_argv += ["--proxy", TDL_PROXY]
+    if task.canceled:
+        return
     task.process = subprocess.Popen(dl_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
 
     last_size = 0
@@ -737,7 +756,6 @@ def _run_task(task):
 
     if task.canceled:
         _cleanup_tmp(task.dl_dir)
-        queue._finish(task)
         return
 
     if task.process.returncode == 0:
@@ -778,7 +796,6 @@ def _run_task(task):
     else:
         _cleanup_tmp(task.dl_dir)
         bot.send_message(task.chat_id, f"❌ 下载失败！\n🔑 使用TDL账号：@{task.tdl_name}")
-    queue._finish(task)
 
 
 def do_single_download(chat_id, channel_id, msg_id, link, rename_name=None):
@@ -866,7 +883,6 @@ def cmd_cancel(msg):
         del active_logins[chat_id]
     user_steps.pop(chat_id, None)
     bot.send_message(chat_id, f"❌ 已取消 {n} 个下载任务")
-    main_menu(chat_id)
 
 @bot.message_handler(func=lambda msg: msg.text == "❌ 取消")
 def btn_cancel(msg):

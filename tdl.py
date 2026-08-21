@@ -4,33 +4,45 @@ import subprocess
 import os
 import threading
 import time
+import logging
 import telebot
 import pexpect
 from time import sleep
 from functools import wraps
 from telebot.types import BotCommand
 from download_queue import DownloadTask, DownloadQueue
+from logutil import setup_logging, redact_phone
+
+# ---- 日志：先配置，保证后面的配置校验失败也能留下记录 ----
+setup_logging(os.environ.get("LOG_LEVEL", "INFO"))
+log = logging.getLogger("__main__")
+queue_log = logging.getLogger("queue")
+download_log = logging.getLogger("download")
+login_log = logging.getLogger("login")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 SUPER_ADMIN_RAW = os.environ.get("SUPER_ADMIN", "")
 DL_BASE_PATH = os.environ.get("DL_BASE_PATH", "").rstrip("/")
 if not DL_BASE_PATH:
-    print("❌ 未设置 DL_BASE_PATH 环境变量！请在 docker-compose.yml 中配置下载目录。")
+    log.critical("未设置 DL_BASE_PATH 环境变量！请在 docker-compose.yml 中配置下载目录。")
     exit(1)
 TDL_PROXY = os.environ.get("TDL_PROXY", "")  # 代理，如 socks5://192.168.31.2:7891
 MAX_CONCURRENT_DL = int(os.environ.get("MAX_CONCURRENT_DL", "2") or 2)
 
 if not BOT_TOKEN or not SUPER_ADMIN_RAW:
-    print("❌ 未设置 BOT_TOKEN 或 SUPER_ADMIN 环境变量！")
-    print("   示例: BOT_TOKEN=123456:ABCdef... SUPER_ADMIN=987654321 docker compose up -d")
+    log.critical("未设置 BOT_TOKEN 或 SUPER_ADMIN 环境变量！")
+    log.critical("   示例: BOT_TOKEN=123456:ABCdef... SUPER_ADMIN=987654321 docker compose up -d")
     exit(1)
 
 try:
     SUPER_ADMIN = int(SUPER_ADMIN_RAW)
 except ValueError:
-    print(f"❌ SUPER_ADMIN 必须是纯数字！当前值: {SUPER_ADMIN_RAW}")
+    log.critical("SUPER_ADMIN 必须是纯数字！当前值: %s", SUPER_ADMIN_RAW)
     exit(1)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+log.info("配置加载完成：MAX_CONCURRENT_DL=%d, DL_BASE_PATH=%s, TDL_PROXY=%s",
+         MAX_CONCURRENT_DL, DL_BASE_PATH, "已启用" if TDL_PROXY else "未启用")
 
 # 持久化文件路径
 DATA_DIR = "data"
@@ -122,7 +134,7 @@ def save_admins():
         with open(ADMIN_FILE, "w", encoding="utf-8") as f:
             json.dump(ADMIN_LIST, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"保存管理员列表失败：{e}")
+        log.error("保存管理员列表失败：%s", e, exc_info=True)
 
 def save_tdl_accounts():
     """保存TDL账号列表到文件"""
@@ -130,7 +142,7 @@ def save_tdl_accounts():
         with open(TDL_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
             json.dump(TDL_ACCOUNTS, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"保存TDL账号失败：{e}")
+        log.error("保存TDL账号失败：%s", e, exc_info=True)
 
 def save_user_current_tdl():
     """保存用户当前TDL账号到文件"""
@@ -138,7 +150,7 @@ def save_user_current_tdl():
         with open(USER_CURRENT_TDL_FILE, "w", encoding="utf-8") as f:
             json.dump(user_current_tdl, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"保存用户TDL账号失败：{e}")
+        log.error("保存用户TDL账号失败：%s", e, exc_info=True)
 
 def save_user_dl_ext():
     """保存用户下载扩展名到文件"""
@@ -146,7 +158,7 @@ def save_user_dl_ext():
         with open(USER_DL_EXT_FILE, "w", encoding="utf-8") as f:
             json.dump(user_dl_ext, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"保存下载类型失败：{e}")
+        log.error("保存下载类型失败：%s", e, exc_info=True)
 
 def get_user_ext(chat_id):
     """获取用户的下载扩展名白名单，空字符串=全部"""
@@ -154,6 +166,8 @@ def get_user_ext(chat_id):
 
 # 初始化加载数据
 load_data()
+log.info("持久化数据加载完成：TDL账号 %d 个、管理员 %d 个",
+         sum(len(v) for v in TDL_ACCOUNTS.values()), len(ADMIN_LIST))
 
 # ==========================
 # 【核心】设置 Telegram 左下角固定菜单
@@ -168,7 +182,7 @@ def set_bot_commands():
         BotCommand("tdl_list", "📜 查看TDL账号列表"),
     ]
     bot.set_my_commands(commands)
-    print("✅ 左下角固定菜单设置完成")
+    log.info("左下角菜单设置完成，共 %d 项", len(commands))
 
 # ==========================
 # 工具函数
@@ -1231,10 +1245,10 @@ def switch_tdl_account(msg):
 # ==========================
 if __name__ == "__main__":
     set_bot_commands()
-    print("机器人已启动，等待指令...")
+    log.info("机器人已启动，等待指令")
     while True:
         try:
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
-            print(f"⚠️ 连接异常，5秒后重试: {e}")
+            log.warning("连接异常，5秒后重试: %s", e)
             sleep(5)

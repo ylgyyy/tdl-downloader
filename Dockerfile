@@ -28,7 +28,7 @@ RUN if [ "$TARGETARCH" = "arm64" ]; then \
     && echo "tdl installed successfully"
 
 # 复制代码
-COPY tdl.py download_queue.py .
+COPY tdl.py download_queue.py logutil.py .
 
 # 环境变量，防止 tdl 终端卡死
 ENV TERM=dumb

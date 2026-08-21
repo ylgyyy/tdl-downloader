@@ -91,3 +91,34 @@ def test_cancel_all():
     assert queue.counts() == {"running": 2, "pending": 0}
     release.set()
     assert wait_until(lambda: queue.counts()["running"] == 0)
+
+
+def test_same_account_stays_serialized_after_finish():
+    """回归：任务完成触发 _pump_locked 时，同账号多个排队任务不能同时启动。"""
+    started = []
+    release_first = threading.Event()
+    release_all = threading.Event()
+    lock = threading.Lock()
+
+    def worker(task):
+        with lock:
+            started.append(task.task_id)
+            is_first = (len(started) == 1)
+        (release_first if is_first else release_all).wait(2.0)
+        queue._finish(task)
+
+    queue = DownloadQueue(2, worker)
+    queue.submit(make_task(1, "acc1"))
+    queue.submit(make_task(1, "acc1"))
+    queue.submit(make_task(1, "acc1"))
+
+    assert wait_until(lambda: len(started) >= 1)
+    assert queue.counts() == {"running": 1, "pending": 2}
+
+    release_first.set()
+    assert wait_until(lambda: len(started) >= 2)
+    # 关键断言：同账号仍只能 1 个 running（buggy 版本此处会 running=2 pending=0）
+    assert queue.counts() == {"running": 1, "pending": 1}
+
+    release_all.set()
+    assert wait_until(lambda: queue.counts()["running"] == 0)

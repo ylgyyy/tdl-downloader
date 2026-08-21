@@ -70,12 +70,12 @@ class DownloadQueue:
             if task.tdl_name in self.busy_accounts:
                 remaining.append(task)  # 同账号串行，跳过
                 continue
-            to_start.append(task)
-        self.pending = remaining
-        for task in to_start:
+            # 必须在循环内同步更新状态，否则后面排队任务看不到已被占用的并发额度/账号
             self.running[task.task_id] = task
             self.busy_accounts.add(task.tdl_name)
             task.status = "running"
+            to_start.append(task)
+        self.pending = remaining
         # Thread.start() 非阻塞，锁内启动安全
         for task in to_start:
             threading.Thread(target=self.worker, args=(task,), daemon=True).start()
